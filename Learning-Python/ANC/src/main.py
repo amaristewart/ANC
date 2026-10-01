@@ -8,7 +8,9 @@ SAMPLE_RATE = 16000
 DURATION_SECONDS = 1
 NUM_TAPS = 32
 RANDOM_SEED = 0
-CONVERGENCE_PLOT_SAMPLES = 2000
+CONVERGENCE_PLOT_SAMPLES = 5000
+SMOOTHING_WINDOW = 100
+SENSOR_NOISE_SNR_DB = 30
 
 LINE_STYLES = {
     'LMS': ('-', 4),
@@ -23,6 +25,12 @@ def generate_reference_noise(sample_rate, duration_seconds, seed):
     rng = np.random.default_rng(seed)
     num_samples = int(sample_rate * duration_seconds)
     return rng.standard_normal(num_samples) / np.sqrt(2)
+
+# White noise from error mic, scaled to a target SNR against clean_signal
+def generate_sensor_noise(clean_signal, snr_db, rng):
+    signal_power = np.mean(clean_signal ** 2)
+    sensor_noise_power = signal_power / 10 ** (snr_db / 10)
+    return rng.standard_normal(len(clean_signal)) * np.sqrt(sensor_noise_power)
 
 ## Helper functions
 
@@ -93,17 +101,23 @@ def fxlms_filter(reference_signal, desired_signal, step_size, num_taps, secondar
 
 ## Calculation functions
 
-# Convert squared error to dB, with a floor to avoid log(0)
-def squared_error_to_db(squared_error):
-    return 10 * np.log10(squared_error + 1e-12)
+# Convert a power value or array to dB, with a floor to avoid log(0)
+def to_db_power(power):
+    return 10 * np.log10(power + 1e-12)
  
-# Return frequencies in Hz and magnitude response in dB for an FIR filter
+# Moving average over full windows only, so the learning curve is readable on noisy data
+# The output is shorter than input by window - 1 samples
+# Output index k corresponds to input sample k + window - 1
+def smooth_squared_error(squared_error, window):
+    return np.convolve(squared_error, np.ones(window) / window, mode='valid')
+
+# Return frequencies in Hz and magnitude response in dB for FIR filter
 def calculate_frequency_response(filter_weights, sample_rate):
     frequencies_hz, frequency_response = freqz(filter_weights, worN=2000, fs=sample_rate)
     magnitude_db = 20 * np.log10(np.abs(frequency_response) + 1e-12)
     return frequencies_hz, magnitude_db
- 
-# Noise left at error mic after learned filter's anti-noise is applied
+
+# Acoustic noise left at error mic after learned filter's anti-noise is applied
 def calculate_residual(noise_at_error_mic, reference_noise, filter_weights, secondary_path=None):
     anti_noise = lfilter(filter_weights, 1, reference_noise)
     # Pass secondary_path for FxLMS, where anti-noise travels through speaker-to-mic path before it reaches error mic
@@ -120,16 +134,20 @@ def calculate_noise_reduction(noise_before, residual_after):
  
 ## Plotting functions
  
-def plot_convergence(squared_errors_by_name, num_samples, save_path=None):
+def plot_convergence(squared_errors_by_name, num_samples, smoothing_window,
+                     noise_floor_db=None, save_path=None):
     plt.figure()
     for name, squared_error in squared_errors_by_name.items():
-        plt.plot(squared_error_to_db(squared_error[:num_samples]), label=name)
+        smoothed = smooth_squared_error(squared_error[:num_samples], smoothing_window)
+        iterations = np.arange(smoothing_window - 1, num_samples)
+        plt.plot(iterations, to_db_power(smoothed), label=name)
+    if noise_floor_db is not None:
+        plt.axhline(noise_floor_db, color='gray', linestyle=':', label='Error mic noise floor')
     plt.xlabel('Iteration')
-    plt.ylabel('Squared error (dB)')
+    plt.ylabel(f'Mean squared error (dB, {smoothing_window}-sample average)')
     plt.legend()
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
- 
  
 def plot_frequency_responses(weights_by_name, primary_path, sample_rate, save_path=None):
     plt.figure()
@@ -169,19 +187,79 @@ def plot_power_spectral_densities(noise_before, residuals_by_name, sample_rate, 
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
  
- 
 ## Audio output
- 
-def write_audio_files(audio_by_filename, sample_rate):
+
+# Normalization
+def write_audio_files(audio_by_filename, sample_rate, peak_limit=0.9):
+    peak = max(np.max(np.abs(audio)) for audio in audio_by_filename.values())
+    gain = min(1.0, peak_limit / peak)
     for filename, audio in audio_by_filename.items():
-        sf.write(filename, audio, sample_rate)
+        sf.write(filename, audio * gain, sample_rate)
+    return gain
  
- 
-## Main
- 
+def calculate_filter_performance(reference_noise, noise_at_error_mic, primary_path, secondary_path, secondary_path_estimate, step_sizes, num_taps_values):
+    convergence_speed = {}
+    steady_state_error = {}
+    divergence_threshold = {}
+    residuals_by_name = {}
+
+    for step_size in step_sizes:
+        for num_taps in num_taps_values:
+            weights_lms, squared_error_lms = lms_filter(
+                reference_noise, noise_at_error_mic, step_size=step_size, num_taps=num_taps)
+            weights_nlms, squared_error_nlms = nlms_filter(
+                reference_noise, noise_at_error_mic, step_size=step_size, num_taps=num_taps)
+            weights_fxlms, squared_error_fxlms = fxlms_filter(
+                reference_noise, noise_at_error_mic, step_size=step_size, num_taps=num_taps,
+                secondary_path=secondary_path, secondary_path_estimate=secondary_path_estimate)
+
+            convergence_speed[(step_size, num_taps)] = np.mean(np.diff(squared_error_lms[:200]))
+            steady_state_error[(step_size, num_taps)] = np.mean(squared_error_lms[200:])
+            divergence_threshold[(step_size, num_taps)] = np.max(squared_error_lms)
+
+            residuals_lms = calculate_residual(noise_at_error_mic, reference_noise, weights_lms)
+            residuals_nlms = calculate_residual(noise_at_error_mic, reference_noise, weights_nlms)
+            residuals_fxlms = calculate_residual(noise_at_error_mic, reference_noise, weights_fxlms, secondary_path)
+
+            # Store residuals in dictionary
+            residuals_by_name['LMS'] = residuals_lms
+            residuals_by_name['NLMS'] = residuals_nlms
+            residuals_by_name['FxLMS'] = residuals_fxlms
+
+    return convergence_speed, steady_state_error, divergence_threshold, residuals_by_name
+
+def plot_results(convergence_speed, steady_state_error, divergence_threshold, save_path=None):
+    plt.figure(figsize=(12, 6))
+
+    plt.subplot(1, 3, 1)
+    for step_size, num_taps in convergence_speed:
+        plt.plot(num_taps, convergence_speed[(step_size, num_taps)], label=f'Step size: {step_size}')
+    plt.xlabel('Number of Taps')
+    plt.ylabel('Convergence Speed (dB/iteration)')
+    plt.legend()
+
+    plt.subplot(1, 3, 2)
+    for step_size, num_taps in steady_state_error:
+        plt.plot(num_taps, steady_state_error[(step_size, num_taps)], label=f'Step size: {step_size}')
+    plt.xlabel('Number of Taps')
+    plt.ylabel('Steady-State Error (dB)')
+    plt.legend()
+
+    plt.subplot(1, 3, 3)
+    for step_size, num_taps in divergence_threshold:
+        plt.plot(num_taps, divergence_threshold[(step_size, num_taps)], label=f'Step size: {step_size}')
+    plt.xlabel('Number of Taps')
+    plt.ylabel('Divergence Threshold (dB)')
+    plt.legend()
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
 def main():
     # Signal setup
     reference_noise = generate_reference_noise(SAMPLE_RATE, DURATION_SECONDS, RANDOM_SEED)
+    clean_signal = np.zeros_like(reference_noise)
  
     # Primary path: how noise travels from its source to the error mic
     primary_path = np.array([0.0, 0.0, 0.8, 0.4, 0.2, 0.1])
@@ -191,55 +269,28 @@ def main():
     secondary_path = np.array([0.0, 0.0, 0.5, 0.3, 0.1])
     secondary_path_estimate = secondary_path.copy()  # perfect estimate for now
  
-    # Run filters
-    weights_lms, squared_error_lms = lms_filter(
-        reference_noise, noise_at_error_mic, step_size=0.01, num_taps=NUM_TAPS)
-    weights_nlms, squared_error_nlms = nlms_filter(
-        reference_noise, noise_at_error_mic, step_size=0.5, num_taps=NUM_TAPS)
-    weights_fxlms, squared_error_fxlms = fxlms_filter(
-        reference_noise, noise_at_error_mic, step_size=0.005, num_taps=NUM_TAPS,
-        secondary_path=secondary_path, secondary_path_estimate=secondary_path_estimate)
- 
-    squared_errors_by_name = {
-        'LMS': squared_error_lms,
-        'NLMS': squared_error_nlms,
-        'FxLMS': squared_error_fxlms,
-    }
-    weights_by_name = {
-        'LMS': weights_lms,
-        'NLMS': weights_nlms,
-        'FxLMS': weights_fxlms,
-    }
- 
-    # Residual noise after cancellation
-    residuals_by_name = {
-        'LMS': calculate_residual(noise_at_error_mic, reference_noise, weights_lms),
-        'NLMS': calculate_residual(noise_at_error_mic, reference_noise, weights_nlms),
-        'FxLMS': calculate_residual(noise_at_error_mic, reference_noise, weights_fxlms,
-                                    secondary_path=secondary_path),
-    }
- 
-    # Noise reduction summary
-    for name, residual in residuals_by_name.items():
-        noise_reduction_db = calculate_noise_reduction(noise_at_error_mic, residual)
-        print(f'{name}: {noise_reduction_db:.1f} dB noise reduction')
- 
-    # Plots
-    plot_convergence(squared_errors_by_name, CONVERGENCE_PLOT_SAMPLES,
-                     save_path='convergence_plot.png')
-    plot_frequency_responses(weights_by_name, primary_path, SAMPLE_RATE,
-                             save_path='frequency_response.png')
-    plot_power_spectral_densities(noise_at_error_mic, residuals_by_name, SAMPLE_RATE,
-                                  save_path='power_spectral_density.png')
-    plt.show()
- 
+    # Vary step size and number of taps
+    step_sizes = np.linspace(0.01, 0.1, 10)
+    num_taps_values = np.linspace(16, 64, 10)
+    num_taps_values = np.round(num_taps_values).astype(int)
+    num_taps_values = np.unique(num_taps_values)  # Ensure unique values
+
+    # Calculate filter performance
+    convergence_speed, steady_state_error, divergence_threshold, residuals_by_name = calculate_filter_performance(
+        reference_noise, noise_at_error_mic, primary_path, secondary_path, secondary_path_estimate, step_sizes, num_taps_values)
+
+    # Plot results
+    plot_results(convergence_speed, steady_state_error, divergence_threshold)
+
     # Audio
-    write_audio_files({
+    gain = write_audio_files({
         'noise_before_cancellation.wav': noise_at_error_mic,
         'residual_after_lms.wav': residuals_by_name['LMS'],
         'residual_after_nlms.wav': residuals_by_name['NLMS'],
         'residual_after_fxlms.wav': residuals_by_name['FxLMS'],
     }, SAMPLE_RATE)
+    if gain < 1.0:
+        print(f'Audio files scaled by {gain:.2f} to avoid clipping (same gain for all files)')
  
  
 if __name__ == '__main__':
