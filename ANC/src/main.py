@@ -1,4 +1,3 @@
-from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import lfilter, freqz, welch
@@ -12,12 +11,6 @@ RANDOM_SEED = 0
 CONVERGENCE_PLOT_SAMPLES = 5000
 SMOOTHING_WINDOW = 100
 SENSOR_NOISE_SNR_DB = 30
-
-# Output folders sit next to src, so ANC/src/main.py writes to ANC/output/audio and ANC/output/plots
-# Paths are built from this file's location, so they do not depend on where the script is run from
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / 'output'
-AUDIO_DIR = OUTPUT_DIR / 'audio'
-PLOTS_DIR = OUTPUT_DIR / 'plots'
 
 # Step sizes for the single baseline comparison
 BASELINE_STEP_SIZES = {'LMS': 0.01, 'NLMS': 0.5, 'FxLMS': 0.02}
@@ -323,13 +316,6 @@ def plot_sweep_results(results, step_sizes_by_name, num_taps_values, num_samples
     if save_path:
         figure.savefig(save_path, dpi=300, bbox_inches='tight')
 
-## Output folders
-
-# Create the output folders if they do not exist yet
-def create_output_folders():
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
-
 ## Audio output
 
 # Write WAV files without clipping
@@ -367,27 +353,22 @@ def run_baseline_comparison(reference_noise, noise_at_error_mic, measured_noise_
         print(f'{name}: {calculate_noise_reduction(noise_at_error_mic, residual):.1f} dB noise reduction')
 
     plot_convergence(squared_errors_by_name, CONVERGENCE_PLOT_SAMPLES, SMOOTHING_WINDOW,
-                     noise_floor_db=to_db_power(sensor_noise_power), save_path=PLOTS_DIR / 'convergence_plot.png')
+                     noise_floor_db=to_db_power(sensor_noise_power), save_path='convergence_plot.png')
     plot_frequency_responses(weights_by_name, primary_path, SAMPLE_RATE,
-                             save_path=PLOTS_DIR / 'frequency_response.png')
+                             save_path='frequency_response.png')
     plot_power_spectral_densities(noise_at_error_mic, residuals_by_name, SAMPLE_RATE,
-                                  save_path=PLOTS_DIR / 'power_spectral_density.png')
+                                  save_path='power_spectral_density.png')
 
     gain = write_audio_files({
-        AUDIO_DIR / 'noise_before_cancellation.wav': noise_at_error_mic,
-        AUDIO_DIR / 'residual_after_lms.wav': residuals_by_name['LMS'],
-        AUDIO_DIR / 'residual_after_nlms.wav': residuals_by_name['NLMS'],
-        AUDIO_DIR / 'residual_after_fxlms.wav': residuals_by_name['FxLMS'],
+        'noise_before_cancellation.wav': noise_at_error_mic,
+        'residual_after_lms.wav': residuals_by_name['LMS'],
+        'residual_after_nlms.wav': residuals_by_name['NLMS'],
+        'residual_after_fxlms.wav': residuals_by_name['FxLMS'],
     }, SAMPLE_RATE)
     if gain < 1.0:
         print(f'Audio files scaled by {gain:.2f} to avoid clipping (same gain for all files)')
-    print(f'Saved baseline plots to {PLOTS_DIR}', flush=True)
-    print(f'Saved audio to {AUDIO_DIR}', flush=True)
 
 def main():
-    print(f'Running {Path(__file__).resolve()}', flush=True)
-    print(f'Output folder: {OUTPUT_DIR}', flush=True)
-    create_output_folders()
     rng = np.random.default_rng(RANDOM_SEED)
     num_samples = int(SAMPLE_RATE * DURATION_SECONDS)
 
@@ -411,14 +392,11 @@ def main():
                             sensor_noise_power, primary_path, secondary_path, secondary_path_estimate)
 
     if RUN_PARAMETER_SWEEP:
-        print('Running parameter sweep, this can take a minute or more', flush=True)
         results = run_parameter_sweep(
             reference_noise, noise_at_error_mic, measured_noise_at_error_mic, sensor_noise_power,
             secondary_path, secondary_path_estimate, SWEEP_STEP_SIZES, SWEEP_NUM_TAPS)
         plot_sweep_results(results, SWEEP_STEP_SIZES, SWEEP_NUM_TAPS, num_samples,
-                           save_path=PLOTS_DIR / 'parameter_sweep.png')
-
-        print(f'Saved sweep plot to {PLOTS_DIR}', flush=True)
+                           save_path='parameter_sweep.png')
 
     plt.show()
 
