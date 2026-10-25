@@ -366,6 +366,15 @@ def run_baseline_comparison(reference_noise, noise_at_error_mic, measured_noise_
     for name, residual in residuals_by_name.items():
         print(f'{name}: {calculate_noise_reduction(noise_at_error_mic, residual):.1f} dB noise reduction')
 
+    print('Iterations to reach noise floor:')
+    for name, squared_error in squared_errors_by_name.items():
+        iterations = calculate_convergence_iterations(
+            squared_error, SMOOTHING_WINDOW, sensor_noise_power, CONVERGENCE_TOLERANCE_DB)
+        if iterations == len(squared_error):
+            print(f'{name}: did not reach the noise floor within {iterations} iterations')
+        else:
+            print(f'{name}: {iterations} iterations')
+
     plot_convergence(squared_errors_by_name, CONVERGENCE_PLOT_SAMPLES, SMOOTHING_WINDOW,
                      noise_floor_db=to_db_power(sensor_noise_power), save_path=PLOTS_DIR / 'convergence_plot.png')
     plot_frequency_responses(weights_by_name, primary_path, SAMPLE_RATE,
