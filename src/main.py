@@ -1,8 +1,14 @@
+import csv
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+import warnings
 from scipy.signal import lfilter, freqz, welch
+from numba.core.errors import NumbaPerformanceWarning
+from anc_core import run_anc, reduction_db
 import soundfile as sf
+
+warnings.filterwarnings('ignore', category=NumbaPerformanceWarning)
 
 ## Configuration
 SAMPLE_RATE = 16000
@@ -13,17 +19,33 @@ CONVERGENCE_PLOT_SAMPLES = 5000
 SMOOTHING_WINDOW = 100
 SENSOR_NOISE_SNR_DB = 30
 
-# Output folders sit next to src, so ANC/src/main.py writes to ANC/output/audio and ANC/output/plots
+# Output folders sit next to src, so ANC/src/main.py writes to ANC/output/<scenario>/audio and plots
 # Paths are built from this file's location, so they do not depend on where the script is run from
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / 'output'
-AUDIO_DIR = OUTPUT_DIR / 'audio'
-PLOTS_DIR = OUTPUT_DIR / 'plots'
+
+# Open the plot windows at the end of the run. Plots are always saved to disk
+SHOW_PLOTS = False
+
+# Primary path: how noise travels from its source to the error mic (simulated)
+PRIMARY_PATH = np.array([0.0, 0.0, 0.8, 0.4, 0.2, 0.1])
+
+# Secondary path scenarios: how anti-noise travels from the speaker to the error mic (simulated)
+# Every scenario uses the same reference signal, primary path and sensor noise, so only this path changes
+#   no_delay: mild coloration, no propagation delay. LMS, NLMS and FxLMS can all be compared
+#   delay_2:  2 sample delay. Plain LMS and NLMS fail because the update ignores the path's phase
+#   delay_4:  4 sample delay, longer than the primary path's 2. The anti-noise cannot arrive in time
+SECONDARY_PATH_SCENARIOS = {
+    'no_delay': np.array([0.5, 0.3, 0.1]),
+    'delay_2': np.array([0.0, 0.0, 0.5, 0.3, 0.1]),
+    'delay_4': np.array([0.0, 0.0, 0.0, 0.0, 0.5, 0.3, 0.1]),
+}
 
 # Step sizes for the single baseline comparison
 BASELINE_STEP_SIZES = {'LMS': 0.01, 'NLMS': 0.5, 'FxLMS': 0.02}
 
 # Parameter sweep. Each algorithm gets its own step size grid because their stable ranges differ:
-# LMS and FxLMS depend on input power and tap count, while NLMS is stable for 0 < step size < 2
+# LMS and FxLMS depend on input power and tap count. NLMS is stable for 0 < step size < 2 when there is no
+# secondary path, and with one in the loop that limit shifts with the path's gain, so 2.1 may not diverge
 RUN_PARAMETER_SWEEP = True
 SWEEP_NUM_TAPS = [8, 16, 32, 64]
 SWEEP_STEP_SIZES = {
@@ -33,6 +55,9 @@ SWEEP_STEP_SIZES = {
 }
 # A run counts as converged when its smoothed error is within this many dB of the error mic noise floor
 CONVERGENCE_TOLERANCE_DB = 3
+
+# Steady-state reduction is measured over the last quarter of the run, after the startup transient
+TAIL_FRACTION_START = 0.75
 
 LINE_STYLES = {
     'LMS': ('-', 4),
@@ -54,83 +79,6 @@ def generate_sensor_noise(clean_signal, snr_db, rng):
 
 ## Helper functions
 
-# Prepend zeros so a full-length window exists at first sample
-def pad_with_zeros(signal, num_taps):
-    return np.concatenate([np.zeros(num_taps - 1), signal])
-
-# Return last num_taps samples ending at sample_index, newest first
-def get_recent_samples(padded_signal, sample_index, num_taps):
-    return padded_signal[sample_index:sample_index + num_taps][::-1]
-
-## Adaptive filters
-
-def lms_filter(reference_signal, desired_signal, step_size, num_taps):
-    num_samples = len(reference_signal)
-    filter_weights = np.zeros(num_taps)
-    error_signal = np.zeros(num_samples)
-    padded_reference = pad_with_zeros(reference_signal, num_taps)
-
-    for sample_index in range(num_samples):
-        recent_reference = get_recent_samples(padded_reference, sample_index, num_taps)
-        filter_output = filter_weights @ recent_reference
-        error_signal[sample_index] = desired_signal[sample_index] - filter_output
-        filter_weights += step_size * error_signal[sample_index] * recent_reference
-
-    return filter_weights, error_signal ** 2
-
-def nlms_filter(reference_signal, desired_signal, step_size, num_taps, regularization=1e-6):
-    num_samples = len(reference_signal)
-    filter_weights = np.zeros(num_taps)
-    error_signal = np.zeros(num_samples)
-    padded_reference = pad_with_zeros(reference_signal, num_taps)
-
-    for sample_index in range(num_samples):
-        recent_reference = get_recent_samples(padded_reference, sample_index, num_taps)
-        filter_output = filter_weights @ recent_reference
-        error_signal[sample_index] = desired_signal[sample_index] - filter_output
-        reference_energy = recent_reference @ recent_reference
-        filter_weights += (step_size * error_signal[sample_index] * recent_reference / (reference_energy + regularization))
-
-    return filter_weights, error_signal ** 2
-
-def fxlms_filter(reference_signal, desired_signal, step_size, num_taps, secondary_path, secondary_path_estimate):
-    num_samples = len(reference_signal)
-    filter_weights = np.zeros(num_taps)
-    error_signal = np.zeros(num_samples)
-
-    # Update uses reference after it passes through secondary path estimate
-    filtered_reference = lfilter(secondary_path_estimate, 1, reference_signal)
-    padded_reference = pad_with_zeros(reference_signal, num_taps)
-    padded_filtered_reference = pad_with_zeros(filtered_reference, num_taps)
-
-    recent_controller_outputs = np.zeros(len(secondary_path))
-
-    for sample_index in range(num_samples):
-        recent_reference = get_recent_samples(padded_reference, sample_index, num_taps)
-        recent_filtered_reference = get_recent_samples(padded_filtered_reference, sample_index, num_taps)
-
-        # Controller output (anti-noise) goes through real secondary path to error mic
-        recent_controller_outputs = np.roll(recent_controller_outputs, 1)
-        recent_controller_outputs[0] = filter_weights @ recent_reference
-        anti_noise_at_error_mic = secondary_path @ recent_controller_outputs
-
-        error_signal[sample_index] = desired_signal[sample_index] - anti_noise_at_error_mic
-        filter_weights += step_size * error_signal[sample_index] * recent_filtered_reference
-
-    return filter_weights, error_signal ** 2
-
-# Run one adaptive filter by name
-def run_adaptive_filter(name, reference_signal, desired_signal, step_size, num_taps,
-                        secondary_path, secondary_path_estimate):
-    if name == 'LMS':
-        return lms_filter(reference_signal, desired_signal, step_size, num_taps)
-    if name == 'NLMS':
-        return nlms_filter(reference_signal, desired_signal, step_size, num_taps)
-    if name == 'FxLMS':
-        return fxlms_filter(reference_signal, desired_signal, step_size, num_taps,
-                            secondary_path, secondary_path_estimate)
-    raise ValueError(f'Unknown algorithm: {name}')
-
 ## Calculation functions
 
 # Convert a power value or array to dB, with a floor to avoid log(0)
@@ -148,25 +96,6 @@ def calculate_frequency_response(filter_weights, sample_rate):
     frequencies_hz, frequency_response = freqz(filter_weights, worN=2000, fs=sample_rate)
     magnitude_db = 20 * np.log10(np.abs(frequency_response) + 1e-12)
     return frequencies_hz, magnitude_db
-
-# Acoustic noise left at error mic after learned filter's anti-noise is applied
-def calculate_residual(noise_at_error_mic, reference_noise, filter_weights, secondary_path=None):
-    anti_noise = lfilter(filter_weights, 1, reference_noise)
-    # Pass secondary_path for FxLMS, where anti-noise travels through speaker-to-mic path before it reaches error mic
-    if secondary_path is not None:
-        anti_noise = lfilter(secondary_path, 1, anti_noise)
-    return noise_at_error_mic - anti_noise
-
-# Residual for a named algorithm. Only FxLMS sends its output through the secondary path
-def calculate_algorithm_residual(name, noise_at_error_mic, reference_noise, filter_weights, secondary_path):
-    path = secondary_path if name == 'FxLMS' else None
-    return calculate_residual(noise_at_error_mic, reference_noise, filter_weights, path)
-
-# Noise reduction in dB. Positive values mean the noise got quieter
-def calculate_noise_reduction(noise_before, residual_after):
-    power_before = np.mean(noise_before ** 2)
-    power_after = np.mean(residual_after ** 2)
-    return 10 * np.log10(power_before / power_after)
 
 # A run has diverged if its error became non-finite or ended larger than it started
 def is_diverged(squared_error, window):
@@ -187,7 +116,7 @@ def calculate_convergence_iterations(squared_error, window, noise_floor_power, t
 
 # Run every algorithm over its step size grid and every tap count
 # Returns, per algorithm, arrays shaped (num tap values, num step sizes)
-def run_parameter_sweep(reference_noise, noise_at_error_mic, measured_noise_at_error_mic,
+def run_parameter_sweep(reference_noise, noise_at_error_mic, sensor_noise,
                         sensor_noise_power, secondary_path, secondary_path_estimate,
                         step_sizes_by_name, num_taps_values):
     results = {}
@@ -199,22 +128,21 @@ def run_parameter_sweep(reference_noise, noise_at_error_mic, measured_noise_at_e
 
         for tap_index, num_taps in enumerate(num_taps_values):
             for step_index, step_size in enumerate(step_sizes):
-                # Diverging runs overflow by design, so their warnings are silenced
+                result = run_anc(name, reference_noise, noise_at_error_mic, sensor_noise,
+                                 num_taps, step_size, secondary_path, secondary_path_estimate)
                 with np.errstate(over='ignore', invalid='ignore'):
-                    weights, squared_error = run_adaptive_filter(
-                        name, reference_noise, measured_noise_at_error_mic, step_size, num_taps,
-                        secondary_path, secondary_path_estimate)
+                    squared_error = result['error'] ** 2
 
                 if is_diverged(squared_error, SMOOTHING_WINDOW):
                     diverged[tap_index, step_index] = True
                     continue
 
-                residual = calculate_algorithm_residual(
-                    name, noise_at_error_mic, reference_noise, weights, secondary_path)
                 convergence_iterations[tap_index, step_index] = calculate_convergence_iterations(
                     squared_error, SMOOTHING_WINDOW, sensor_noise_power, CONVERGENCE_TOLERANCE_DB)
-                noise_reduction_db[tap_index, step_index] = calculate_noise_reduction(
-                    noise_at_error_mic, residual)
+                # Steady-state reduction from the actual adaptive run, last 25% of samples
+                tail_start = int(TAIL_FRACTION_START * len(noise_at_error_mic))
+                noise_reduction_db[tap_index, step_index] = reduction_db(
+                    noise_at_error_mic, result['residual'], tail_start)
 
             print(f'{name}: finished {num_taps} taps')
 
@@ -228,8 +156,10 @@ def run_parameter_sweep(reference_noise, noise_at_error_mic, measured_noise_at_e
 ## Plotting functions
 
 def plot_convergence(squared_errors_by_name, num_samples, smoothing_window,
-                     noise_floor_db=None, save_path=None):
+                     noise_floor_db=None, save_path=None, title=None):
     plt.figure()
+    if title:
+        plt.title(title)
     for name, squared_error in squared_errors_by_name.items():
         smoothed = smooth_squared_error(squared_error[:num_samples], smoothing_window)
         iterations = np.arange(smoothing_window - 1, num_samples)
@@ -242,18 +172,23 @@ def plot_convergence(squared_errors_by_name, num_samples, smoothing_window,
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
-def plot_frequency_responses(weights_by_name, primary_path, sample_rate, save_path=None):
+def plot_frequency_responses(weights_by_name, primary_path, secondary_path, sample_rate,
+                             save_path=None, title=None):
     plt.figure()
+    if title:
+        plt.title(title)
     for name, weights in weights_by_name.items():
         line_style, line_width = LINE_STYLES.get(name, ('-', 2))
         frequencies_hz, magnitude_db = calculate_frequency_response(weights, sample_rate)
         plt.plot(frequencies_hz, magnitude_db,
                  linestyle=line_style, linewidth=line_width, label=name)
 
-    frequencies_hz, primary_path_db = calculate_frequency_response(primary_path, sample_rate)
-    plt.plot(frequencies_hz, primary_path_db,
-             color='red', linestyle=':', linewidth=2,
-             label='Primary path (target for LMS/NLMS)')
+    # With the secondary path in the loop, the ideal controller is W = P / S
+    frequencies_hz, primary_response = freqz(primary_path, worN=2000, fs=sample_rate)
+    _, secondary_response = freqz(secondary_path, worN=2000, fs=sample_rate)
+    ideal_db = 20 * np.log10(np.abs(primary_response / secondary_response) + 1e-12)
+    plt.plot(frequencies_hz, ideal_db, color='red', linestyle=':', linewidth=2,
+             label='Ideal controller (P / S)')
 
     plt.xlabel('Frequency (Hz)')
     plt.ylabel('Magnitude (dB)')
@@ -262,8 +197,10 @@ def plot_frequency_responses(weights_by_name, primary_path, sample_rate, save_pa
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
 # Overlay the PSD before cancellation with the residual PSD for each algorithm
-def plot_power_spectral_densities(noise_before, residuals_by_name, sample_rate, save_path=None):
+def plot_power_spectral_densities(noise_before, residuals_by_name, sample_rate, save_path=None, title=None):
     plt.figure(figsize=(10, 6))
+    if title:
+        plt.title(title)
 
     frequencies_hz, psd_before = welch(noise_before, fs=sample_rate)
     plt.semilogy(frequencies_hz, psd_before, color='black', linewidth=2,
@@ -304,10 +241,13 @@ def plot_sweep_heatmap(axis, values, diverged, step_sizes, num_taps_values,
                 label = number_format.format(values[tap_index, step_index])
             axis.text(step_index, tap_index, label, ha='center', va='center', fontsize=7,
                       bbox=dict(boxstyle='round,pad=0.1', facecolor='white', alpha=0.6, linewidth=0))
-    plt.colorbar(image, ax=axis)
+    if not np.all(diverged):
+        plt.colorbar(image, ax=axis)
 
-def plot_sweep_results(results, step_sizes_by_name, num_taps_values, num_samples, save_path=None):
+def plot_sweep_results(results, step_sizes_by_name, num_taps_values, num_samples, save_path=None, title=None):
     figure, axes = plt.subplots(len(results), 2, figsize=(14, 3.4 * len(results)))
+    if title:
+        figure.suptitle(title)
     for row, (name, result) in enumerate(results.items()):
         step_sizes = step_sizes_by_name[name]
         plot_sweep_heatmap(axes[row, 0], result['convergence_iterations'], result['diverged'],
@@ -319,16 +259,19 @@ def plot_sweep_results(results, step_sizes_by_name, num_taps_values, num_samples
     figure.text(0.5, 0.005,
                 f'div = diverged. {num_samples} iterations = did not reach the noise floor within the run.',
                 ha='center', fontsize=9)
-    figure.tight_layout(rect=(0, 0.02, 1, 1))
+    figure.tight_layout(rect=(0, 0.02, 1, 0.97 if title else 1))
     if save_path:
         figure.savefig(save_path, dpi=300, bbox_inches='tight')
 
 ## Output folders
 
-# Create the output folders if they do not exist yet
-def create_output_folders():
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+# Create the output folders for one scenario if they do not exist yet
+def create_output_folders(scenario_name):
+    audio_dir = OUTPUT_DIR / scenario_name / 'audio'
+    plots_dir = OUTPUT_DIR / scenario_name / 'plots'
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    return audio_dir, plots_dir
 
 ## Audio output
 
@@ -346,90 +289,129 @@ def write_audio_files(audio_by_filename, sample_rate, peak_limit=0.9):
 ## Main stages
 
 # One run of each algorithm at its baseline step size, with plots and audio
-def run_baseline_comparison(reference_noise, noise_at_error_mic, measured_noise_at_error_mic,
-                            sensor_noise_power, primary_path, secondary_path, secondary_path_estimate):
+# Returns one summary row per algorithm for the cross-scenario table
+def run_baseline_comparison(scenario_name, audio_dir, plots_dir, reference_noise, noise_at_error_mic,
+                            sensor_noise, sensor_noise_power, primary_path, secondary_path,
+                            secondary_path_estimate):
     weights_by_name = {}
     squared_errors_by_name = {}
     residuals_by_name = {}
+    summary_rows = []
+    tail_start = int(TAIL_FRACTION_START * len(noise_at_error_mic))
 
     for name, step_size in BASELINE_STEP_SIZES.items():
-        weights, squared_error = run_adaptive_filter(
-            name, reference_noise, measured_noise_at_error_mic, step_size, NUM_TAPS,
-            secondary_path, secondary_path_estimate)
-        weights_by_name[name] = weights
-        squared_errors_by_name[name] = squared_error
-        # Acoustic residual excludes the mic's own noise, so it is what a listener at the error mic hears
-        residuals_by_name[name] = calculate_algorithm_residual(
-            name, noise_at_error_mic, reference_noise, weights, secondary_path)
+        result = run_anc(name, reference_noise, noise_at_error_mic, sensor_noise,
+                         NUM_TAPS, step_size, secondary_path, secondary_path_estimate)
+        with np.errstate(over='ignore', invalid='ignore'):
+            squared_error = result['error'] ** 2
+        row = {'scenario': scenario_name, 'algorithm': name, 'step_size': step_size,
+               'status': 'diverged', 'whole_run_db': None, 'last_25_percent_db': None,
+               'iterations_to_noise_floor': None}
+        if is_diverged(squared_error, SMOOTHING_WINDOW):
+            print(f'{name}: diverged at step size {step_size}, excluded from plots and audio')
+            summary_rows.append(row)
+            continue
 
-    print(f'Error mic SNR: {SENSOR_NOISE_SNR_DB} dB')
-    for name, residual in residuals_by_name.items():
-        print(f'{name}: {calculate_noise_reduction(noise_at_error_mic, residual):.1f} dB noise reduction')
-
-    print('Iterations to reach noise floor:')
-    for name, squared_error in squared_errors_by_name.items():
         iterations = calculate_convergence_iterations(
             squared_error, SMOOTHING_WINDOW, sensor_noise_power, CONVERGENCE_TOLERANCE_DB)
-        if iterations == len(squared_error):
-            print(f'{name}: did not reach the noise floor within {iterations} iterations')
-        else:
-            print(f'{name}: {iterations} iterations')
+        row.update(status='ok',
+                   whole_run_db=round(float(reduction_db(noise_at_error_mic, result['residual'])), 1),
+                   last_25_percent_db=round(float(reduction_db(noise_at_error_mic, result['residual'], tail_start)), 1),
+                   iterations_to_noise_floor=None if iterations == len(squared_error) else iterations)
+        summary_rows.append(row)
+        weights_by_name[name] = result['weights']
+        squared_errors_by_name[name] = squared_error
+        residuals_by_name[name] = result['residual']
 
+    if not residuals_by_name:
+        print('No algorithm converged at its baseline step size, nothing to plot')
+        return summary_rows
+
+    print(f'Error mic SNR: {SENSOR_NOISE_SNR_DB} dB')
+    for row in summary_rows:
+        if row['status'] == 'ok':
+            iterations = row['iterations_to_noise_floor']
+            reached = f'{iterations} iterations to noise floor' if iterations else 'did not reach the noise floor'
+            print(f"{row['algorithm']}: {row['whole_run_db']:.1f} dB whole run, "
+                  f"{row['last_25_percent_db']:.1f} dB last 25%, {reached}")
+
+    title = f'Simulated paths, scenario: {scenario_name}'
     plot_convergence(squared_errors_by_name, CONVERGENCE_PLOT_SAMPLES, SMOOTHING_WINDOW,
-                     noise_floor_db=to_db_power(sensor_noise_power), save_path=PLOTS_DIR / 'convergence_plot.png')
-    plot_frequency_responses(weights_by_name, primary_path, SAMPLE_RATE,
-                             save_path=PLOTS_DIR / 'frequency_response.png')
+                     noise_floor_db=to_db_power(sensor_noise_power),
+                     save_path=plots_dir / 'convergence_plot.png', title=title)
+    plot_frequency_responses(weights_by_name, primary_path, secondary_path, SAMPLE_RATE,
+                             save_path=plots_dir / 'frequency_response.png', title=title)
     plot_power_spectral_densities(noise_at_error_mic, residuals_by_name, SAMPLE_RATE,
-                                  save_path=PLOTS_DIR / 'power_spectral_density.png')
+                                  save_path=plots_dir / 'power_spectral_density.png', title=title)
 
-    gain = write_audio_files({
-        AUDIO_DIR / 'noise_before_cancellation.wav': noise_at_error_mic,
-        AUDIO_DIR / 'residual_after_lms.wav': residuals_by_name['LMS'],
-        AUDIO_DIR / 'residual_after_nlms.wav': residuals_by_name['NLMS'],
-        AUDIO_DIR / 'residual_after_fxlms.wav': residuals_by_name['FxLMS'],
-    }, SAMPLE_RATE)
+    audio_by_filename = {audio_dir / 'noise_before_cancellation.wav': noise_at_error_mic}
+    for name, residual in residuals_by_name.items():
+        audio_by_filename[audio_dir / f'residual_after_{name.lower()}.wav'] = residual
+    gain = write_audio_files(audio_by_filename, SAMPLE_RATE)
     if gain < 1.0:
         print(f'Audio files scaled by {gain:.2f} to avoid clipping (same gain for all files)')
-    print(f'Saved baseline plots to {PLOTS_DIR}', flush=True)
-    print(f'Saved audio to {AUDIO_DIR}', flush=True)
+    print(f'Saved baseline plots to {plots_dir}', flush=True)
+    print(f'Saved audio to {audio_dir}', flush=True)
+    return summary_rows
+
+# Print and save the baseline results of every scenario in one table
+def save_summary_table(summary_rows, path):
+    columns = ['scenario', 'algorithm', 'step_size', 'status', 'whole_run_db',
+               'last_25_percent_db', 'iterations_to_noise_floor']
+    with open(path, 'w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    print('\nSummary at baseline step sizes (noise reduction in dB, last 25% of the run)')
+    print(f'{"scenario":10s} ' + ' '.join(f'{name:>10s}' for name in BASELINE_STEP_SIZES))
+    for scenario_name in SECONDARY_PATH_SCENARIOS:
+        cells = []
+        for name in BASELINE_STEP_SIZES:
+            row = next(r for r in summary_rows if r['scenario'] == scenario_name and r['algorithm'] == name)
+            cells.append('diverged' if row['status'] == 'diverged' else f"{row['last_25_percent_db']:.1f}")
+        print(f'{scenario_name:10s} ' + ' '.join(f'{cell:>10s}' for cell in cells))
+    print(f'Saved summary table to {path}', flush=True)
 
 def main():
     print(f'Running {Path(__file__).resolve()}', flush=True)
     print(f'Output folder: {OUTPUT_DIR}', flush=True)
-    create_output_folders()
     rng = np.random.default_rng(RANDOM_SEED)
     num_samples = int(SAMPLE_RATE * DURATION_SECONDS)
 
-    # Primary path: how noise travels from its source to the error mic
-    primary_path = np.array([0.0, 0.0, 0.8, 0.4, 0.2, 0.1])
-
-    # Secondary path: how anti-noise travels from the speaker to the error mic
-    secondary_path = np.array([0.0, 0.0, 0.5, 0.3, 0.1])
-    secondary_path_estimate = secondary_path.copy()  # perfect estimate for now
-
-    # Signals
+    # Signals are generated once and shared by every scenario
     reference_noise = generate_reference_noise(num_samples, rng)
-    noise_at_error_mic = lfilter(primary_path, 1, reference_noise)
+    noise_at_error_mic = lfilter(PRIMARY_PATH, 1, reference_noise)
     sensor_noise = generate_sensor_noise(noise_at_error_mic, SENSOR_NOISE_SNR_DB, rng)
     sensor_noise_power = np.mean(sensor_noise ** 2)
 
-    # The filters adapt on what the error mic actually measures, which includes its own noise
-    measured_noise_at_error_mic = noise_at_error_mic + sensor_noise
+    summary_rows = []
+    for scenario_name, secondary_path in SECONDARY_PATH_SCENARIOS.items():
+        print(f'\n=== Scenario: {scenario_name} ===', flush=True)
+        audio_dir, plots_dir = create_output_folders(scenario_name)
+        secondary_path_estimate = secondary_path.copy()  # perfect estimate for now
 
-    run_baseline_comparison(reference_noise, noise_at_error_mic, measured_noise_at_error_mic,
-                            sensor_noise_power, primary_path, secondary_path, secondary_path_estimate)
+        summary_rows += run_baseline_comparison(
+            scenario_name, audio_dir, plots_dir, reference_noise, noise_at_error_mic, sensor_noise,
+            sensor_noise_power, PRIMARY_PATH, secondary_path, secondary_path_estimate)
 
-    if RUN_PARAMETER_SWEEP:
-        print('Running parameter sweep, this can take a minute or more', flush=True)
-        results = run_parameter_sweep(
-            reference_noise, noise_at_error_mic, measured_noise_at_error_mic, sensor_noise_power,
-            secondary_path, secondary_path_estimate, SWEEP_STEP_SIZES, SWEEP_NUM_TAPS)
-        plot_sweep_results(results, SWEEP_STEP_SIZES, SWEEP_NUM_TAPS, num_samples,
-                           save_path=PLOTS_DIR / 'parameter_sweep.png')
+        if RUN_PARAMETER_SWEEP:
+            print('Running parameter sweep', flush=True)
+            results = run_parameter_sweep(
+                reference_noise, noise_at_error_mic, sensor_noise, sensor_noise_power,
+                secondary_path, secondary_path_estimate, SWEEP_STEP_SIZES, SWEEP_NUM_TAPS)
+            plot_sweep_results(results, SWEEP_STEP_SIZES, SWEEP_NUM_TAPS, num_samples,
+                               save_path=plots_dir / 'parameter_sweep.png',
+                               title=f'Simulated paths, scenario: {scenario_name}')
+            print(f'Saved sweep plot to {plots_dir}', flush=True)
 
-        print(f'Saved sweep plot to {PLOTS_DIR}', flush=True)
+        if not SHOW_PLOTS:
+            plt.close('all')
 
-    plt.show()
+    save_summary_table(summary_rows, OUTPUT_DIR / 'scenario_summary.csv')
+
+    if SHOW_PLOTS:
+        plt.show()
 
 if __name__ == '__main__':
     main()

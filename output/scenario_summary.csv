@@ -1,0 +1,10 @@
+scenario,algorithm,step_size,status,whole_run_db,last_25_percent_db,iterations_to_noise_floor
+no_delay,LMS,0.01,ok,19.4,43.4,1855
+no_delay,NLMS,0.5,ok,27.8,37.1,625
+no_delay,FxLMS,0.02,ok,19.9,42.3,2395
+delay_2,LMS,0.01,diverged,,,
+delay_2,NLMS,0.5,diverged,,,
+delay_2,FxLMS,0.02,ok,19.8,42.3,2010
+delay_4,LMS,0.01,diverged,,,
+delay_4,NLMS,0.5,diverged,,,
+delay_4,FxLMS,0.02,ok,-0.1,-0.1,
