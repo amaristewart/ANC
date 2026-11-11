@@ -149,9 +149,7 @@ This simulation helped me better understand the difference between adaptive filt
 
 LMS provides a straightforward way to update filter coefficients, but its performance depends heavily on the relationship between step size, input power, filter length, and the acoustic path. NLMS addresses some sensitivity to signal level by normalizing the coefficient updates, but it does not compensate for secondary-path delay. FxLMS adds another layer by accounting for the secondary path between the controller output and the error microphone.
 
-The updated results also show that convergence speed, stability, and steady-state noise reduction are related but separate performance measures. A filter can converge quickly without reaching the lowest residual error, and a stable run can still fail to produce meaningful cancellation.
-
-The loudspeaker, acoustic path, and error microphone are all part of the control system. Comparing the algorithms under the same conditions makes it clearer why FxLMS is better suited to delayed secondary paths, and why the timing of the noise and anti-noise can ultimately limit what an ANC system can achieve.
+The results also show that convergence speed, stability, and steady-state noise reduction are related but separate performance measures. A filter can converge quickly without reaching the lowest residual error, and a stable run can still fail to produce meaningful cancellation.
 
 ## Running the Simulation
 
