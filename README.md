@@ -143,50 +143,6 @@ A cell labeled 16000 indicates that the algorithm was not classified as diverged
 
 Gray cells labeled `div` indicate that the run diverged according to the simulation's stability criterion.
 
-## Findings
-
-### 1. Secondary-Path Delay Changes LMS and NLMS Stability
-
-The biggest difference from my original simulation is that LMS and NLMS now have to send their cancelling signals through the secondary path, just like FxLMS. When this path has no leading delay, both algorithms reduce noise at their baseline step sizes. When the secondary path has a 2-sample delay, both are classified as diverged.
-
-This shows that the stability of an adaptive filter depends on more than its step size and input power. In an ANC system, the timing and phase changes introduced by the secondary path affect the relationship between the update and the measured error.
-
-### 2. Normalization Does Not Correct for the Secondary Path
-
-NLMS normalizes the update by the reference signal energy, which can make step-size selection less sensitive to input amplitude and filter length. However, it still uses the raw reference for adaptation. The delay-2 result shows that normalization alone does not correct for the phase and delay introduced by the loudspeaker-to-microphone path.
-
-The familiar `0 < μ < 2` rule applies to standard NLMS under particular assumptions and should not be treated as a general stability guarantee for this ANC loop.
-
-### 3. LMS and NLMS Can Perform Differently Depending on the Acoustic Path
-
-In the no-delay scenario, both LMS and NLMS achieve substantial noise reduction with the selected baseline parameters. NLMS reaches the convergence threshold faster, but LMS achieves a lower residual over the last quarter of the run.
-
-These differences are not necessarily intrinsic advantages of either algorithm. Their step sizes are different, and the parameter sweeps show how performance changes with controller length and step size.
-
-### 4. Filter Length and Step Size Still Affect Stability
-
-The parameter sweeps continue to show that filter length and step size influence convergence and residual error. Longer filters have more coefficients to adapt, and a step size that works for one tap count may not be appropriate for another.
-
-However, the stability limits from an ordinary LMS system-identification problem cannot simply be transferred to an ANC system with a secondary path. The path's gain, phase, and delay also need to be considered.
-
-### 5. More Taps Do Not Necessarily Mean Better Cancellation
-
-The primary path is only six taps long, so increasing the controller length does not automatically improve results. Extra coefficients can make adaptation more sensitive to noise or require a different step size.
-
-The updated sweep evaluates the actual residual during adaptation, which is more useful for comparing real-time ANC behavior than measuring only how well the final filter would cancel a recording afterward.
-
-### 6. FxLMS Accounts for Secondary-Path Delay
-
-FxLMS filters the reference through an estimate of the secondary path before updating the weights. With the 2-sample secondary path, this allows it to converge while ordinary LMS and NLMS are classified as diverged at their baseline step sizes.
-
-This is a useful demonstration of why FxLMS is designed for ANC: the controller must take the physical path from the loudspeaker to the error microphone into account when adapting.
-
-### 7. Even FxLMS Cannot Overcome Every Acoustic Delay
-
-When the secondary path has a 4-sample delay and the primary path has only a 2-sample delay, the cancelling signal cannot reach the error microphone before the unpredictable part of the disturbance. FxLMS remains numerically stable according to the chosen criterion but produces almost no reduction.
-
-This demonstrates an important limitation of feedforward ANC. A perfect estimate of the secondary path is not enough if the controller does not have sufficient time to act. More predictable noise could produce different results.
-
 ## Conclusion
 
 This simulation helped me better understand the difference between adaptive filtering in general and adaptive filtering specifically for active noise control.
