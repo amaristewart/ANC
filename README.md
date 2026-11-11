@@ -1,6 +1,6 @@
-# Active Noise Control: LMS, NLMS, and FxLMS Simulation
+# Active Noise Control: LMS, NLMS, and FxNLMS Simulation
 
-A Python simulation exploring feedforward active noise control (ANC) by comparing three adaptive filtering algorithms: Least Mean Squares (LMS), Normalized Least Mean Squares (NLMS), and Filtered-x Least Mean Squares (FxLMS). The goal is to better understand how each algorithm adapts, how quickly it converges, how much noise it can reduce, and how changes in step size, filter length, and secondary-path delay affect its stability.
+A Python simulation exploring feedforward active noise control (ANC) by comparing four adaptive filtering algorithms: Least Mean Squares (LMS), Normalized Least Mean Squares (NLMS), Filtered-x Least Mean Squares (FxLMS), and Filtered-x Normalized Least Mean Squares (FxNLMS). The goal is to better understand how each algorithm adapts, how quickly it converges, how much noise it can reduce, and how changes in step size, filter length, and secondary-path delay affect its stability.
 
 ## Overview
 
@@ -8,7 +8,7 @@ Active noise control works by generating a signal that is approximately equal in
 
 One important part of ANC is that the signal coming from the loudspeaker does not reach the error microphone instantly. It passes through what is called the secondary path, which includes the loudspeaker, acoustic environment, and microphone response. This makes ANC more complicated than simply inverting the incoming noise signal.
 
-This simulation models the reference noise, the primary path from the noise source to the error microphone, three secondary path scenarios from the loudspeaker to the error microphone, and sensor noise at the error microphone with a 30 dB signal-to-noise ratio (SNR).All three algorithms operate within the same acoustic model.
+This simulation models the reference noise, the primary path from the noise source to the error microphone, three secondary path scenarios from the loudspeaker to the error microphone, and sensor noise at the error microphone with a 30 dB signal-to-noise ratio (SNR). All four algorithms operate within the same acoustic model.
 
 ## Signal Model
 
@@ -65,13 +65,25 @@ The filtered reference gives the algorithm a better representation of how change
 
 My main takeaway from looking at FxLMS is that the controller has to account for the actual signal path between the loudspeaker and the error microphone. Simply applying regular LMS to the same setup would ignore an important part of the system and would not give the correct gradient for minimizing the acoustic error.
 
+**FxNLMS (Filtered-x Normalized Least Mean Squares)**
+
+FxNLMS combines the secondary-path compensation used by FxLMS with the input-energy normalization used by NLMS. Like FxLMS, it filters the reference signal through an estimate of the secondary path. Unlike FxLMS, it divides the coefficient update by the energy of that *filtered* reference vector:
+
+`w(n+1) = w(n) + μ * e(n) * x_f(n) / (x_f(n)'x_f(n) + eps)`
+
+Here, `x_f(n) = s_hat * x(n)` is the filtered reference input vector, `s_hat` is the estimated secondary path, and `eps` prevents division by zero. The weights are updated using the measured error signal, including the simulated error-microphone sensor noise.
+
+The main advantage of FxNLMS is that the normalization makes its coefficient updates less sensitive to changes in the filtered reference signal's energy. Unlike ordinary NLMS, it also accounts for the secondary path when calculating the update direction. However, normalization does not remove the effects of secondary-path estimation errors, delay, or insufficient advance time, and a larger step size can still cause unstable behavior.
+
+In this experiment, FxNLMS uses a baseline step size of `μ = 0.5`, while FxLMS uses `μ = 0.02`. Those values are not directly comparable as a measure of adaptation aggressiveness, because the FxNLMS update is normalized. The parameter sweep explores FxNLMS step sizes from `0.05` to `2.1` across 8, 16, 32, and 64 taps.
+
 ## Evaluation Method
 
-LMS, NLMS, and FxLMS are now evaluated using the same feedforward ANC model. For every algorithm, the controller output passes through the true secondary path before reaching the error microphone. The difference is in how the weights are updated: LMS and NLMS use the unfiltered reference signal, while FxLMS uses a reference filtered through the estimated secondary path.
+LMS, NLMS, FxLMS, and FxNLMS are evaluated using the same feedforward ANC model. For every algorithm, the controller output passes through the true secondary path before reaching the error microphone. The difference is in how the weights are updated: LMS and NLMS use the unfiltered reference signal, while FxLMS and FxNLMS use a reference filtered through the estimated secondary path. NLMS normalizes by the raw-reference energy, whereas FxNLMS normalizes by the filtered-reference energy.
 
 The simulation compares three secondary paths: `no_delay`, `delay_2`, and `delay_4`. The primary path has a 2-sample delay, so these scenarios allow me to examine how the timing of the anti-noise affects cancellation. Each scenario uses the same realization of reference noise and sensor noise, making it easier to isolate the impact of the secondary path.
 
-Noise reduction is now calculated directly from the residual of the adaptive run, rather than applying the final filter coefficients to the entire signal afterward. The residual is the original disturbance minus the anti-noise after it passes through the secondary path. I report both whole-run noise reduction and noise reduction over the last 25% of samples. The latter is more representative of performance after the initial adaptation period.
+Noise reduction is calculated directly from the residual of the adaptive run, rather than applying the final filter coefficients to the entire signal afterward. The residual is the original disturbance minus the anti-noise after it passes through the secondary path. I report both whole-run noise reduction and noise reduction over the last 25% of samples. The latter is more representative of performance after the initial adaptation period.
 
 The error microphone's own sensor noise is excluded from this acoustic residual calculation. This explains why the reported noise reduction can exceed the 30 dB SNR of the error microphone. The 30 dB value describes the microphone's measurement quality, not a hard limit on the amount of acoustic noise the controller can cancel. However, sensor noise still affects adaptation because the filter updates are based on the measured error signal, which contains that noise.
 
@@ -83,27 +95,27 @@ The 3 dB tolerance allows the smoothed error to be up to approximately twice the
 
 Baseline runs (32 taps, 1 second at 16 kHz). The table reports noise reduction measured over the last 25% of each run:
 
-| Secondary path | LMS (μ = 0.01) | NLMS (μ = 0.5) | FxLMS (μ = 0.02) |
-|---|---:|---:|---:|
-| No delay | 43.4 dB | 37.1 dB | 42.3 dB |
-| 2-sample delay | Diverged | Diverged | 42.3 dB |
-| 4-sample delay | Diverged | Diverged | -0.1 dB |
+| Secondary path | LMS (μ = 0.01) | NLMS (μ = 0.5) | FxLMS (μ = 0.02) | FxNLMS (μ = 0.5) |
+|---|---:|---:|---:|---:|
+| No delay | 43.4 dB | 37.1 dB | 42.3 dB | 33.0 dB |
+| 2-sample delay | Diverged | Diverged | 42.3 dB | 32.8 dB |
+| 4-sample delay | Diverged | Diverged | -0.1 dB | -2.4 dB |
 
-In the no-delay scenario, all three algorithms reduce the acoustic noise substantially. NLMS reaches the defined noise-floor threshold fastest (625 iterations), compared with 1,855 for LMS and 2,395 for FxLMS. However, its last-quarter noise reduction is lower than the other two algorithms at their chosen baseline step sizes.
+In the no-delay scenario, all four algorithms reduce the acoustic noise substantially. NLMS reaches the defined noise-floor threshold fastest (625 iterations), compared with 677 for FxNLMS, 1,855 for LMS, and 2,395 for FxLMS. FxNLMS reaches the threshold nearly as quickly as NLMS, but its last-quarter noise reduction (33.0 dB) is lower than the other three algorithms at these baseline settings.
 
-With a 2-sample secondary-path delay, LMS and NLMS are classified as diverged, while FxLMS still achieves 42.3 dB of noise reduction over the last quarter and reaches the threshold in 2,010 iterations. This is the clearest example of why the update needs to account for the secondary path.
+With a 2-sample secondary-path delay, LMS and NLMS are classified as diverged. FxLMS achieves 42.3 dB of noise reduction over the last quarter and reaches the threshold in 2,010 iterations, while FxNLMS achieves 32.8 dB and reaches the threshold in 252 iterations. This is the clearest example of why the update needs to account for the secondary path. FxNLMS reaches the threshold faster here, but FxLMS achieves greater last-quarter noise reduction at the tested step sizes.
 
-With a 4-sample delay, FxLMS does not diverge according to the simulation's criterion, but it produces approximately -0.1 dB reduction and does not reach the noise-floor threshold. The primary-path disturbance arrives two samples earlier than the anti-noise can, limiting cancellation of unpredictable white noise.
+With a 4-sample delay, neither FxLMS nor FxNLMS is flagged as diverged by the simulation's practical criterion, but FxLMS produces approximately -0.1 dB reduction and FxNLMS produces -2.4 dB over the last quarter. Neither reaches the noise-floor threshold. The primary-path disturbance arrives two samples earlier than the anti-noise can, limiting cancellation of unpredictable white noise. Negative reduction means the acoustic residual has *more* power than the original disturbance.
 
 ### No-delay scenario
 
 ![Convergence](output/no_delay/plots/convergence_plot.png)
 
-The convergence plot shows that NLMS reaches the defined threshold first, followed by LMS and FxLMS. These convergence times should not be interpreted as universal algorithm rankings, since each method uses its own step size.
+The convergence plot shows that NLMS reaches the defined threshold first, followed closely by FxNLMS, then LMS and FxLMS. These convergence times should not be interpreted as universal algorithm rankings, since each method uses its own step size.
 
 ![Frequency response](output/no_delay/plots/frequency_response.png)
 
-The frequency-response plot compares the controller weights learned by each algorithm with the ideal controller magnitude, `P(z)/S(z)`, where `P(z)` is the primary path and `S(z)` is the secondary path. All three algorithms are now trying to cancel noise through the same secondary path rather than learning different target systems.
+The frequency-response plot compares the controller weights learned by each algorithm with the ideal controller magnitude, `P(z)/S(z)`, where `P(z)` is the primary path and `S(z)` is the secondary path. All four algorithms are trying to cancel noise through the same secondary path rather than learning different target systems.
 
 ![Power spectral density](output/no_delay/plots/power_spectral_density.png)
 
@@ -117,7 +129,7 @@ The power spectral density plot compares the original disturbance with the acous
 
 ![Power spectral density](output/delay_2/plots/power_spectral_density.png)
 
-Only FxLMS is included in the saved baseline plots and audio for this scenario because LMS and NLMS are classified as diverged at their baseline step sizes.
+Only FxLMS and FxNLMS are included in the saved baseline plots and residual audio for this scenario because LMS and NLMS are classified as diverged at their baseline step sizes.
 
 ### Four-sample-delay scenario
 
@@ -127,7 +139,7 @@ Only FxLMS is included in the saved baseline plots and audio for this scenario b
 
 ![Power spectral density](output/delay_4/plots/power_spectral_density.png)
 
-The near-zero reduction for FxLMS shows that a controller can remain stable without achieving useful cancellation. The longer secondary-path delay prevents the controller from acting early enough on this unpredictable noise source.
+The near-zero reduction for FxLMS and negative reduction for FxNLMS show that a controller can remain numerically stable without achieving useful cancellation. The longer secondary-path delay prevents the controller from acting early enough on this unpredictable noise source.
 
 ### Parameter sweep
 
@@ -137,7 +149,7 @@ The near-zero reduction for FxLMS shows that a controller can remain stable with
 
 ![Parameter sweep: four-sample delay](output/delay_4/plots/parameter_sweep.png)
 
-The parameter sweep tests how filter length and step size affect convergence and stability for each of the three secondary paths. It tests 8, 16, 32, and 64 taps, using algorithm-specific step-size grids. The reduction heatmaps now show results from the last 25% of the adaptive run, rather than results from applying final weights to the full signal.
+The parameter sweep tests how filter length and step size affect convergence and stability for all four algorithms across each of the three secondary paths. It tests 8, 16, 32, and 64 taps, using algorithm-specific step-size grids. The reduction heatmaps show results from the last 25% of the adaptive run, rather than results from applying final weights to the full signal.
 
 A cell labeled 16000 indicates that the algorithm was not classified as diverged but did not reach the defined convergence threshold during the 16,000-sample run. It does not necessarily mean the algorithm was converging slowly at a constant rate; it may have reached a steady-state error above the threshold.
 
@@ -147,7 +159,7 @@ Gray cells labeled `div` indicate that the run diverged according to the simulat
 
 This simulation helped me better understand the difference between adaptive filtering in general and adaptive filtering specifically for active noise control.
 
-LMS provides a straightforward way to update filter coefficients, but its performance depends heavily on the relationship between step size, input power, filter length, and the acoustic path. NLMS addresses some sensitivity to signal level by normalizing the coefficient updates, but it does not compensate for secondary-path delay. FxLMS adds another layer by accounting for the secondary path between the controller output and the error microphone.
+LMS provides a straightforward way to update filter coefficients, but its performance depends heavily on the relationship between step size, input power, filter length, and the acoustic path. NLMS addresses some sensitivity to signal level by normalizing the coefficient updates, but it does not compensate for secondary-path delay. FxLMS adds another layer by accounting for the secondary path between the controller output and the error microphone. FxNLMS combines this secondary-path compensation with normalization by the filtered reference energy, which can change adaptation speed and sensitivity to input level. In these tests, FxNLMS reaches the specified noise-floor threshold faster than FxLMS in the no-delay and 2-sample-delay scenarios, while FxLMS achieves greater last-quarter noise reduction at their chosen baseline step sizes.
 
 The results also show that convergence speed, stability, and steady-state noise reduction are related but separate performance measures. A filter can converge quickly without reaching the lowest residual error, and a stable run can still fail to produce meaningful cancellation.
 
@@ -160,4 +172,4 @@ python -m pip install numpy scipy matplotlib soundfile numba
 python src/main.py
 ```
 
-The script saves plots and WAV files under `output/no_delay/`, `output/delay_2/`, and `output/delay_4/`, with separate `plots/` and `audio/` folders in each. It also writes `output/scenario_summary.csv` containing baseline results for all scenarios. Set `RUN_PARAMETER_SWEEP = False` to skip the sweeps or `SHOW_PLOTS = True` to open plot windows. The shared adaptive loop is implemented in `anc_core.py`; it also supports FxNLMS, although the current experiment driver only compares LMS, NLMS, and FxLMS.
+The script saves plots and WAV files under `output/no_delay/`, `output/delay_2/`, and `output/delay_4/`, with separate `plots/` and `audio/` folders in each. It also writes `output/scenario_summary.csv` containing baseline results for all scenarios. Set `RUN_PARAMETER_SWEEP = False` to skip the sweeps or `SHOW_PLOTS = True` to open plot windows. The shared adaptive loop in `anc_core.py` implements all four algorithms, including FxNLMS. The experiment driver compares all four methods in each secondary-path scenario, and includes FxNLMS in the convergence, frequency-response, PSD, and parameter-sweep plots. For successful baseline runs, it saves `residual_after_lms.wav`, `residual_after_nlms.wav`, `residual_after_fxlms.wav`, and `residual_after_fxnlms.wav` alongside `noise_before_cancellation.wav`; algorithms marked as diverged are excluded from the baseline plots and WAV exports. The output is written to the `output/` folder adjacent to the main script, so keep the driver in the intended project directory.

@@ -2,9 +2,12 @@ scenario,algorithm,step_size,status,whole_run_db,last_25_percent_db,iterations_t
 no_delay,LMS,0.01,ok,19.4,43.4,1855
 no_delay,NLMS,0.5,ok,27.8,37.1,625
 no_delay,FxLMS,0.02,ok,19.9,42.3,2395
+no_delay,FxNLMS,0.5,ok,29.2,33.0,677
 delay_2,LMS,0.01,diverged,,,
 delay_2,NLMS,0.5,diverged,,,
 delay_2,FxLMS,0.02,ok,19.8,42.3,2010
+delay_2,FxNLMS,0.5,ok,31.8,32.8,252
 delay_4,LMS,0.01,diverged,,,
 delay_4,NLMS,0.5,diverged,,,
 delay_4,FxLMS,0.02,ok,-0.1,-0.1,
+delay_4,FxNLMS,0.5,ok,-2.6,-2.4,

@@ -18,20 +18,16 @@ RANDOM_SEED = 0
 CONVERGENCE_PLOT_SAMPLES = 5000
 SMOOTHING_WINDOW = 100
 SENSOR_NOISE_SNR_DB = 30
-
-# Output folders sit next to src, so ANC/src/main.py writes to ANC/output/<scenario>/audio and plots
-# Paths are built from this file's location, so they do not depend on where the script is run from
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / 'output'
 
-# Open the plot windows at the end of the run. Plots are always saved to disk
-SHOW_PLOTS = False
+SHOW_PLOTS = True
 
 # Primary path: how noise travels from its source to the error mic (simulated)
 PRIMARY_PATH = np.array([0.0, 0.0, 0.8, 0.4, 0.2, 0.1])
 
 # Secondary path scenarios: how anti-noise travels from the speaker to the error mic (simulated)
 # Every scenario uses the same reference signal, primary path and sensor noise, so only this path changes
-#   no_delay: mild coloration, no propagation delay. LMS, NLMS and FxLMS can all be compared
+#   no_delay: mild coloration, no propagation delay. LMS, NLMS, FxLMS and FxNLMS can all be compared
 #   delay_2:  2 sample delay. Plain LMS and NLMS fail because the update ignores the path's phase
 #   delay_4:  4 sample delay, longer than the primary path's 2. The anti-noise cannot arrive in time
 SECONDARY_PATH_SCENARIOS = {
@@ -41,17 +37,18 @@ SECONDARY_PATH_SCENARIOS = {
 }
 
 # Step sizes for the single baseline comparison
-BASELINE_STEP_SIZES = {'LMS': 0.01, 'NLMS': 0.5, 'FxLMS': 0.02}
+BASELINE_STEP_SIZES = {'LMS': 0.01, 'NLMS': 0.5, 'FxLMS': 0.02, 'FxNLMS': 0.5}
 
-# Parameter sweep. Each algorithm gets its own step size grid because their stable ranges differ:
-# LMS and FxLMS depend on input power and tap count. NLMS is stable for 0 < step size < 2 when there is no
-# secondary path, and with one in the loop that limit shifts with the path's gain, so 2.1 may not diverge
+# Parameter sweep: LMS and FxLMS use unnormalized updates; NLMS and FxNLMS
+# normalize by their respective regressor energy. 2.1 is intentionally included
+# to explore behavior outside conventional idealized normalized-LMS ranges.
 RUN_PARAMETER_SWEEP = True
 SWEEP_NUM_TAPS = [8, 16, 32, 64]
 SWEEP_STEP_SIZES = {
     'LMS': np.logspace(-2.3, -0.5, 8),
     'NLMS': np.array([0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 1.9, 2.1]),
     'FxLMS': np.logspace(-2.3, -0.5, 8),
+    'FxNLMS': np.array([0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 1.9, 2.1]),
 }
 # A run counts as converged when its smoothed error is within this many dB of the error mic noise floor
 CONVERGENCE_TOLERANCE_DB = 3
@@ -63,6 +60,7 @@ LINE_STYLES = {
     'LMS': ('-', 4),
     'NLMS': ('--', 2),
     'FxLMS': ('-', 2),
+    'FxNLMS': (':', 2),
 }
 
 ## Signal generation
@@ -76,8 +74,6 @@ def generate_sensor_noise(clean_signal, snr_db, rng):
     signal_power = np.mean(clean_signal ** 2)
     sensor_noise_power = signal_power / 10 ** (snr_db / 10)
     return rng.standard_normal(len(clean_signal)) * np.sqrt(sensor_noise_power)
-
-## Helper functions
 
 ## Calculation functions
 
@@ -186,7 +182,8 @@ def plot_frequency_responses(weights_by_name, primary_path, secondary_path, samp
     # With the secondary path in the loop, the ideal controller is W = P / S
     frequencies_hz, primary_response = freqz(primary_path, worN=2000, fs=sample_rate)
     _, secondary_response = freqz(secondary_path, worN=2000, fs=sample_rate)
-    ideal_db = 20 * np.log10(np.abs(primary_response / secondary_response) + 1e-12)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ideal_db = 20 * np.log10(np.abs(primary_response / secondary_response) + 1e-12)
     plt.plot(frequencies_hz, ideal_db, color='red', linestyle=':', linewidth=2,
              label='Ideal controller (P / S)')
 
@@ -324,7 +321,7 @@ def run_baseline_comparison(scenario_name, audio_dir, plots_dir, reference_noise
         residuals_by_name[name] = result['residual']
 
     if not residuals_by_name:
-        print('No algorithm converged at its baseline step size, nothing to plot')
+        print('No baseline algorithms passed the stability check; nothing to plot')
         return summary_rows
 
     print(f'Error mic SNR: {SENSOR_NOISE_SNR_DB} dB')
